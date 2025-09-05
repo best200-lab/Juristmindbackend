@@ -7,7 +7,7 @@ import uuid
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import aiohttp
@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 # Base URL for chat storage (configure as needed for your deployment)
-BASE_CHAT_URL = os.getenv("BASE_CHAT_URL", "http://127.0.0.1:8000")  # Default to localhost
+BASE_CHAT_URL = os.getenv("BASE_CHAT_URL", "https://juristmind.onrender.com")  # Updated for Render
 
 app = FastAPI()
 
@@ -146,7 +146,7 @@ async def query_grok(question: str):
                     if citations:
                         response += f"\n\nSource: {citations[0]}"  # Append single citation
                     return sanitize_response(response)
-                except (KeyError, IndexError):
+                except (KeyError, IndexIndexError):
                     return sanitize_response("[Error] Unexpected JuristMind API response format.")
 
     except aiohttp.ClientError as e:
@@ -175,6 +175,18 @@ def store_chat(question: str, response: str):
         json.dump(chat_data, f)
     # Return correct path to the chats folder
     return f"{BASE_CHAT_URL}/public/chats/{chat_id}.json"
+
+@app.get("/")
+async def root():
+    return JSONResponse({"message": "Welcome to JuristMind, your AI legal assistant for Nigerian law!"})
+
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse("static/favicon.ico", media_type="image/x-icon")
+
+@app.get("/ask")
+async def ask_question_get():
+    return JSONResponse({"message": "Please use a POST request to /ask with a JSON body containing your question."})
 
 @app.post("/ask")
 async def ask_question(request: QuestionRequest):
