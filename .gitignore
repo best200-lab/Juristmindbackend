@@ -2,4 +2,3 @@ venv/
 __pycache__/
 *.pyc
 public/chats/*.json
-.env
