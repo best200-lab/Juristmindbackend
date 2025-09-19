@@ -5,9 +5,7 @@ import os
 import re
 import uuid
 import time
-import sqlite3
-from typing import Dict, Optional, List, Any
-from datetime import datetime
+from typing import Dict, Optional, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
@@ -17,210 +15,6 @@ import aiohttp
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from fastapi.middleware.cors import CORSMiddleware
 from aiohttp import ClientTimeout
-
-# Session Management Class
-class IntelligentChatSession:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.user_info: Dict[str, Any] = {}
-        self.conversation_history: List[Dict[str, Any]] = []
-        self.custom_facts: Dict[str, Any] = {}
-        
-        # Load existing data from database
-        self.load_from_db()
-    
-    def load_from_db(self):
-        """Load session data from database"""
-        try:
-            conn = sqlite3.connect('data/chat_sessions.db')
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT user_info, conversation_history, custom_facts FROM sessions WHERE session_id = ?', 
-                (self.session_id,)
-            )
-            
-            result = cursor.fetchone()
-            if result:
-                self.user_info = json.loads(result[0]) if result[0] else {}
-                self.conversation_history = json.loads(result[1]) if result[1] else []
-                self.custom_facts = json.loads(result[2]) if result[2] else {}
-            
-            conn.close()
-        except sqlite3.Error as e:
-            logging.error(f"Error loading session from database: {e}")
-    
-    def save_to_db(self):
-        """Save session data to database"""
-        try:
-            conn = sqlite3.connect('data/chat_sessions.db')
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO sessions 
-                (session_id, user_info, conversation_history, custom_facts, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (
-                self.session_id,
-                json.dumps(self.user_info),
-                json.dumps(self.conversation_history),
-                json.dumps(self.custom_facts)
-            ))
-            
-            conn.commit()
-            conn.close()
-        except sqlite3.Error as e:
-            logging.error(f"Error saving session to database: {e}")
-    
-    def extract_and_remember(self, message: str) -> bool:
-        """
-        Extract personal information from message and store it
-        Returns True if information was found and stored
-        """
-        message_lower = message.lower()
-        extracted = False
-        
-        # Pattern matching for different types of information
-        patterns = {
-            'name': [
-                r"(my name is|i am|call me) ([A-Za-z\s]+)(?:\.|$)",
-                r"(^|\.|\s)([A-Z][a-z]+ [A-Z][a-z]+) is my name"
-            ],
-            'age': [
-                r"(i am|i'm) (\d+) years old",
-                r"(my age is|i am) (\d+)(?:\.|$)"
-            ],
-            'location': [
-                r"(i live in|i'm from) ([A-Za-z\s]+)(?:\.|$)",
-                r"(my city is|my country is) ([A-Za-z\s]+)(?:\.|$)"
-            ],
-            'email': [
-                r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
-            ],
-            'phone': [
-                r"(\d{3}[-\.\s]??\d{3}[-\.\s]??\d{4}|\(\d{3}\)\s*\d{3}[-\.\s]??\d{4}|\d{3}[-\.\s]??\d{4})"
-            ]
-        }
-        
-        # Try to extract information using patterns
-        for info_type, regex_list in patterns.items():
-            for pattern in regex_list:
-                match = re.search(pattern, message_lower)
-                if match:
-                    # Extract the value (different patterns might have different group numbers)
-                    value = match.group(2) if len(match.groups()) >= 2 else match.group(1)
-                    if value:
-                        self.user_info[info_type] = value.strip()
-                        extracted = True
-                        self.save_to_db()  # Save immediately when info is found
-        
-        # Handle custom facts (e.g., "I like pizza")
-        fact_patterns = [
-            r"(i like|i love|i enjoy) ([^\.]+)(?:\.|$)",
-            r"(my favorite [^ ]+ is) ([^\.]+)(?:\.|$)",
-            r"(i have|i own) ([^\.]+)(?:\.|$)",
-            r"(i work as|i am a) ([^\.]+)(?:\.|$)"
-        ]
-        
-        for pattern in fact_patterns:
-            match = re.search(pattern, message_lower)
-            if match:
-                fact_key = match.group(1).strip()
-                fact_value = match.group(2).strip()
-                self.custom_facts[fact_key] = fact_value
-                extracted = True
-                self.save_to_db()  # Save immediately when info is found
-        
-        return extracted
-    
-    def remember_fact(self, key: str, value: Any):
-        """Manually remember a fact"""
-        self.custom_facts[key] = value
-        self.save_to_db()
-    
-    def recall(self, key: str) -> Optional[Any]:
-        """Recall information from memory"""
-        if key in self.user_info:
-            return self.user_info[key]
-        elif key in self.custom_facts:
-            return self.custom_facts[key]
-        else:
-            return None
-    
-    def get_conversation_context(self, max_messages: int = 10) -> List[Dict[str, Any]]:
-        """Get recent conversation history for context"""
-        return self.conversation_history[-max_messages:]
-    
-    def add_to_history(self, user_message: str, ai_response: str):
-        """Add a message exchange to history"""
-        self.conversation_history.append({
-            'user': user_message,
-            'ai': ai_response,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        # Keep history manageable
-        if len(self.conversation_history) > 100:  # Keep last 100 exchanges
-            self.conversation_history = self.conversation_history[-100:]
-        
-        # Save to database
-        self.save_to_db()
-    
-    def handle_memory_queries(self, user_input: str) -> Optional[str]:
-        """Handle queries about remembered information"""
-        user_input_lower = user_input.lower()
-        
-        memory_queries = {
-            'name': ['what is my name', 'do you know my name', 'what did i say my name was'],
-            'age': ['how old am i', 'what is my age', 'did i tell you my age'],
-            'location': ['where do i live', 'what is my location', 'where am i from'],
-            'email': ['what is my email', 'do you know my email'],
-            'phone': ['what is my phone number', 'do you know my phone number']
-        }
-        
-        for info_type, queries in memory_queries.items():
-            for query in queries:
-                if query in user_input_lower:
-                    value = self.recall(info_type)
-                    if value:
-                        if info_type == 'name':
-                            return f"Your name is {value}!"
-                        elif info_type == 'age':
-                            return f"You are {value} years old!"
-                        elif info_type == 'location':
-                            return f"You live in {value}!"
-                        elif info_type == 'email':
-                            return f"Your email is {value}!"
-                        elif info_type == 'phone':
-                            return f"Your phone number is {value}!"
-                    else:
-                        return f"I don't know your {info_type} yet. Could you tell me?"
-        
-        # Handle custom fact queries
-        for fact_key, fact_value in self.custom_facts.items():
-            if fact_key in user_input_lower:
-                return f"Yes, you told me that {fact_key} {fact_value}!"
-        
-        # Check for "what do you know about me" type questions
-        if 'what do you know about me' in user_input_lower or 'what have i told you' in user_input_lower:
-            if not self.user_info and not self.custom_facts:
-                return "I don't know anything about you yet. Tell me something about yourself!"
-            
-            response = "Here's what I know about you:\n"
-            if self.user_info:
-                response += "\nPersonal information:\n"
-                for key, value in self.user_info.items():
-                    response += f"- Your {key}: {value}\n"
-            
-            if self.custom_facts:
-                response += "\nOther facts:\n"
-                for key, value in self.custom_facts.items():
-                    response += f"- {key}: {value}\n"
-            
-            return response
-        
-        return None
-
-# Global session storage
-chat_sessions: Dict[str, IntelligentChatSession] = {}
 
 # Simple regex-based classification (no NLTK for speed)
 def classify_query(query: str) -> Dict:
@@ -260,40 +54,29 @@ def classify_query(query: str) -> Dict:
     
     return classification
 
-def build_reasoned_prompt(query: str, classification: Dict, conversation_history: List[Dict] = None, is_case_with_sources: bool = False) -> str:
+def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[Dict] = None, is_case_with_sources: bool = False) -> str:
     """
-    Build a structured prompt that enforces reasoning with proper conversation context.
+    Build a structured prompt that enforces reasoning. For cases, include instructions for at least 2 legal sections and detailed facts.
+    For drafts, emphasize detailed, professional drafting. Include chat history for context.
     """
-    # Build conversation context from history
     history_context = ""
-    if conversation_history:
-        # Format the conversation history for the prompt
-        history_context = "\n\nPrevious conversation:\n"
-        for msg in conversation_history[-6:]:  # Last 6 exchanges (3 back-and-forths)
-            if 'user' in msg and 'ai' in msg:
-                history_context += f"User: {msg['user']}\n"
-                history_context += f"Assistant: {msg['ai']}\n\n"
-            elif 'role' in msg and 'content' in msg:
-                # Handle the old format too
-                role = "User" if msg['role'] == 'user' else "Assistant"
-                history_context += f"{role}: {msg['content']}\n\n"
+    if chat_history:
+        history_context = "\nPrevious conversation context:\n" + "\n".join([f"{msg['role'].title()}: {msg['content'][:200]}..." for msg in chat_history[-3:]]) + "\nStay on topic and build on the ongoing discussion.\n"
     
-    base_prompt = f"{history_context}Current query: {query}\n\n"
+    base_prompt = f"User query: {query}\n{history_context}\n\nFirst, understand the user's intent: They want information on {classification['intent']} related to Nigerian law where applicable. Follow the chat trend.\n"
     
-    base_prompt += "First, understand the user's intent based on the conversation history and current query.\n"
-    
-    base_prompt += "\nNow, reason step by step:\n1. Consider the full conversation context and what was previously discussed.\n2. Restate what the user is asking in your own words, considering the ongoing discussion.\n3. Use your knowledge and any search results provided by the system to answer accurately.\n"
+    base_prompt += "\nNow, reason step by step:\n1. Restate what the user is asking in your own words, considering the chat context.\n2. Use your knowledge and any search results provided by the system to answer accurately.\n"
     
     if classification['use_sections_cases'] and is_case_with_sources:
-        base_prompt += "4. For this legal case, draw from 3 sources for accuracy: 1 web source (e.g., legal databases), 1 news source (recent developments), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation.\n"
+        base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 1 web source (e.g., legal databases), 1 news source (recent developments), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation.\n"
     elif classification['use_sections_cases']:
-        base_prompt += "4. Structure for legal cases: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance).\n"
+        base_prompt += "3. Structure for legal cases: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance).\n"
     elif classification['is_draft']:
-        base_prompt += "4. Take your time to craft a very detailed, professional, irresistible, and perfect draft tailored to Nigerian legal standards. Make it comprehensive, with precise language, all necessary clauses, and impeccable structure. At the end, reference and state the relevant sections of the law that underpin the draft.\n"
+        base_prompt += "3. Take your time to craft a very detailed, professional, irresistible, and perfect draft tailored to Nigerian legal standards. Make it comprehensive, with precise language, all necessary clauses, and impeccable structure. At the end, reference and state the relevant sections of the law that underpin the draft.\n"
     else:
-        base_prompt += "4. Provide a clear, factual, and helpful answer that continues the conversation naturally.\n"
+        base_prompt += "3. Provide a clear, factual, and helpful answer.\n"
     
-    base_prompt += "5. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. Do not mention sources, reasoning, or search processes in the response. Maintain conversation continuity."
+    base_prompt += "4. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. Do not mention sources, reasoning, or search processes in the response."
     
     return base_prompt
 
@@ -499,24 +282,6 @@ async def ask_question(request: QuestionRequest):
     if not question:
         return JSONResponse({"answer": "Question cannot be empty"})
 
-    # Get or create session
-    if chat_id and chat_id in chat_sessions:
-        session = chat_sessions[chat_id]
-    else:
-        if not chat_id:
-            chat_id = str(uuid.uuid4())
-        session = IntelligentChatSession(chat_id)
-        chat_sessions[chat_id] = session
-
-    # Check for memory queries first
-    memory_response = session.handle_memory_queries(question)
-    if memory_response:
-        session.add_to_history(question, memory_response)
-        return JSONResponse({"answer": memory_response, "chat_id": chat_id})
-
-    # Extract and remember information from the question
-    session.extract_and_remember(question)
-
     general_answer = handle_general_query(question)
     classification = classify_query(question)
 
@@ -525,53 +290,40 @@ async def ask_question(request: QuestionRequest):
         full_text = ""
         citations = []
         has_error = False
-        search_params = None
+        search_params = None  # Default: No search for speed
         messages = []
+        history = []
 
-        # Prepare conversation history for the prompt
-        conversation_history = session.conversation_history
-        
-        # Add system prompt with memory context
-        memory_context = ""
-        if session.user_info or session.custom_facts:
-            memory_context = "\nUser information to remember: "
-            if session.user_info:
-                memory_context += " ".join([f"{k}: {v}" for k, v in session.user_info.items()])
-            if session.custom_facts:
-                memory_context += " ".join([f"{k}: {v}" for k, v in session.custom_facts.items()])
-            memory_context += "\n"
-        
-        system_prompt = f"You are JuristMind, a logical legal AI specializing in Nigerian law. Always reason before answering and quote both specific statutes and cases applicable in your responses.{memory_context}"
-        messages.append({"role": "system", "content": system_prompt})
+        # Load or initialize chat history
+        if chat_id:
+            chat_data = load_chat_history(chat_id)
+            if chat_data:
+                history = chat_data.get("history", [])
+                messages = history.copy()
+            else:
+                # If invalid chat_id provided, reset history but keep same chat_id
+                history = []
+        else:
+            # New conversation → generate a fresh chat_id
+            chat_id = str(uuid.uuid4())
+            history = []
+
+        # Add system prompt
+        messages.insert(0, {"role": "system", "content": "You are JuristMind, a logical legal AI specializing in Nigerian law. Always reason before answering and quote both  specific statutes and cases applicable in your responses."})
+
+        # Append user question
+        user_msg = {"role": "user", "content": question}
+        messages.append(user_msg)
+        history.append(user_msg)
 
         if general_answer:
-            # For general answers, just return them directly
             sanitized = sanitize_response(general_answer)
-            session.add_to_history(question, sanitized)
+            assistant_msg = {"role": "assistant", "content": sanitized}
+            messages.append(assistant_msg)
+            history.append(assistant_msg)
+            full_text = sanitized
             yield f"data: {json.dumps({'content': sanitized})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'chat_id': chat_id, 'chat_url': f'{BASE_CHAT_URL}/public/chats/{chat_id}.json'})}\n\n"
-            return
         else:
-            # Build the reasoned prompt with conversation history
-            custom_prompt = build_reasoned_prompt(question, classification, conversation_history)
-            
-            # Special handling for legal cases: Enable search with 2 sources
-            if classification['intent'] == 'legal_case':
-                search_params = {
-                    "mode": "auto",
-                    "return_citations": True,
-                    "max_search_results": 2,
-                    "sources": [
-                        {"type": "web"},
-                        {"type": "news"}
-                    ]
-                }
-                # Add the case-specific instructions to the prompt
-                custom_prompt += "\n\nNote: This is a legal case query. Please provide detailed analysis with specific legal references."
-
-            # Add the user message with the custom prompt
-            messages.append({"role": "user", "content": custom_prompt})
-
             # Handle drafts with template (no search)
             if classification['is_draft']:
                 template_name = "default_legal"
@@ -588,7 +340,35 @@ async def ask_question(request: QuestionRequest):
                     yield f"data: {json.dumps({'content': sanitized_prefix})}\n\n"
                     full_text += sanitized_prefix
 
-            # Stream response from Grok
+            # Special handling for legal cases: Enable search with 2 sources (web, news, latest X via prompt)
+            if classification['intent'] == 'legal_case':
+                search_params = {
+                    "mode": "auto",
+                    "return_citations": True,
+                    "max_search_results": 2,  # Allow up to 2 for depth (1 web, 1 news, 1 X/news hybrid)
+                    "sources": [
+                        {"type": "web"},  # 1. Web for legal facts
+                        {"type": "news"}   # 2. News for updates; Grok will incorporate latest X via search/prompt
+                    ]
+                }
+                custom_prompt = build_reasoned_prompt(question, classification, history, is_case_with_sources=True)
+                messages[-1]["content"] = custom_prompt  # Override user content with full prompt
+            else:
+                # Set search only if needed (for speed: max_results=1, focused sources)
+                if classification['needs_search']:
+                    search_params = {
+                        "mode": "auto",
+                        "return_citations": True,
+                        "max_search_results": 1,  # Minimal for speed
+                        "sources": [
+                            {"type": "web"},  # Primary: Web for facts/cases
+                            {"type": "news"}   # Secondary: News for recent
+                        ]
+                    }
+                custom_prompt = build_reasoned_prompt(question, classification, history)
+                messages[-1]["content"] = custom_prompt  # Override user content with full prompt
+
+            # Stream response
             async for item in query_grok(messages, search_params):
                 if item["type"] == "content":
                     delta = item["delta"]
@@ -603,25 +383,32 @@ async def ask_question(request: QuestionRequest):
                     yield f"data: {json.dumps({'content': error_msg})}\n\n"
                     full_text += error_msg
 
+            # Append assistant response to history
+            assistant_msg = {"role": "assistant", "content": full_text}
+            history.append(assistant_msg)
+
+            # Add citations if available (but prompt hides source mentions)
+            if citations and not has_error:
+                # For cases, citations are internal; don't add to output to hide logic
+                if classification['intent'] != 'legal_case':
+                    source_str = "\n\nSources: " + "; ".join([str(c) for c in citations])
+                    sanitized_source = sanitize_response(source_str)
+                    yield f"data: {json.dumps({'content': sanitized_source})}\n\n"
+                    full_text += sanitized_source
+                    history[-1]["content"] += sanitized_source
+
             # Add suffix for drafts
             if 'suffix' in locals() and suffix and classification['is_draft'] and not has_error:
                 sanitized_suffix = sanitize_response(suffix)
                 yield f"data: {json.dumps({'content': sanitized_suffix})}\n\n"
                 full_text += sanitized_suffix
+                history[-1]["content"] += sanitized_suffix
 
         if not has_error:
-            # Add to conversation history
-            session.add_to_history(question, full_text)
-            
-            # Also save to the JSON chat history for compatibility
-            chat_data = load_chat_history(chat_id) or {"id": chat_id, "history": []}
-            chat_data["history"].extend([
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": full_text}
-            ])
-            save_chat_history(chat_id, chat_data["history"])
-            
+            logger.info("Processing complete, storing chat.")
+            save_chat_history(chat_id, history)
         chat_url = f"{BASE_CHAT_URL}/public/chats/{chat_id}.json"
+        logger.info(f"Chat stored at: {chat_url}")
         yield f"data: {json.dumps({'type': 'done', 'chat_id': chat_id, 'chat_url': chat_url})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -632,64 +419,6 @@ async def get_chat(chat_id: str):
     if not chat_data:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat_data
-
-@app.get("/session/{chat_id}/memory")
-async def get_session_memory(chat_id: str):
-    """Get the memory information for a session"""
-    if chat_id in chat_sessions:
-        session = chat_sessions[chat_id]
-        return {
-            "user_info": session.user_info,
-            "custom_facts": session.custom_facts,
-            "conversation_count": len(session.conversation_history)
-        }
-    else:
-        # Try to load from database
-        session = IntelligentChatSession(chat_id)
-        if session.user_info or session.custom_facts:
-            chat_sessions[chat_id] = session
-            return {
-                "user_info": session.user_info,
-                "custom_facts": session.custom_facts,
-                "conversation_count": len(session.conversation_history)
-            }
-        else:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    # Create data directory if it doesn't exist
-    os.makedirs("data", exist_ok=True)
-    os.makedirs("public/chats", exist_ok=True)
-    os.makedirs("templates", exist_ok=True)
-    os.makedirs("static", exist_ok=True)
-    
-    # Initialize database
-    try:
-        conn = sqlite3.connect('data/chat_sessions.db')
-        cursor = conn.cursor()
-        
-        # Create sessions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                user_info TEXT,
-                conversation_history TEXT,
-                custom_facts TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Create indexes for better performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at)')
-        
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully!")
-    except sqlite3.Error as e:
-        logger.error(f"Error initializing database: {e}")
 
 if __name__ == "__main__":
     import uvicorn
