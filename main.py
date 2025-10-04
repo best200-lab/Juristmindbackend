@@ -291,10 +291,12 @@ async def ask_question(request: QuestionRequest):
 
     # Dynamic model selection
     model = "grok-3"  # Default
-    if classification['intent'] in ['legal_case', 'general_legal']:  # For cases and solving questions
+    if classification['intent'] == 'draft':
+        model = "grok-4-fast"  # Grok-4-fast for all drafts
+    elif classification['intent'] in ['legal_case', 'general_legal']:  # For cases and solving questions
         model = "grok-4"
     if re.search(r'\b(think deep|think)\b', q_lower):
-        model = "grok-4-fast"  # Fast reasoning for deep thinks
+        model = "grok-4-fast"  # Fast reasoning override for deep thinks
 
     async def generate():
         nonlocal general_answer, chat_id, model
@@ -335,7 +337,7 @@ async def ask_question(request: QuestionRequest):
             full_text = sanitized
             yield f"data: {json.dumps({'content': sanitized})}\n\n"
         else:
-            # Handle drafts with template (no search)
+            # Handle drafts with template
             if classification['is_draft']:
                 template_name = "default_legal"
                 template = load_template(template_name)
@@ -351,33 +353,31 @@ async def ask_question(request: QuestionRequest):
                     yield f"data: {json.dumps({'content': sanitized_prefix})}\n\n"
                     full_text += sanitized_prefix
 
-            # Special handling for legal cases: Enable search with 3 sources (2 web, 1 x)
+            # Special handling for legal cases: Enable search with unique sources (web + news + x)
             if classification['intent'] == 'legal_case':
-                max_results = 5 if re.search(r'\b(think deep|think)\b', q_lower) else 3  # More results for deep thinks
                 search_params = {
                     "mode": "auto",
                     "return_citations": True,
-                    "max_search_results": max_results,
+                    "max_search_results": 3,  # Fixed at 3
                     "sources": [
-                        {"type": "web"},  # 1. Web for legal facts
-                        {"type": "web"},  # 2. Additional web
-                        {"type": "x"}     # 3. X for discussions (not cited)
+                        {"type": "web"},   # 1. General web for legal facts
+                        {"type": "news"},  # 2. News websites for updates
+                        {"type": "x"}      # 3. X for discussions (not cited)
                     ]
                 }
                 custom_prompt = build_reasoned_prompt(question, classification, history, is_case_with_sources=True)
                 messages[-1]["content"] = custom_prompt  # Override user content with full prompt
             else:
-                # Set search only if needed (for speed: max_results=3, 2 web + 1 x)
-                if classification['needs_search']:
-                    max_results = 5 if re.search(r'\b(think deep|think)\b', q_lower) else 3  # More for deep thinks
+                # Set search only if needed (including for drafts now; fixed at 3 results)
+                if classification['needs_search'] or classification['is_draft']:
                     search_params = {
                         "mode": "auto",
                         "return_citations": True,
-                        "max_search_results": max_results,
+                        "max_search_results": 3,  # Fixed at 3
                         "sources": [
-                            {"type": "web"},  # Primary: Web for facts/cases
-                            {"type": "web"},  # Secondary: Additional web
-                            {"type": "x"}     # Tertiary: X (not cited)
+                            {"type": "web"},   # Primary: General web
+                            {"type": "news"},  # Secondary: News websites
+                            {"type": "x"}      # Tertiary: X (not cited)
                         ]
                     }
                 custom_prompt = build_reasoned_prompt(question, classification, history)
