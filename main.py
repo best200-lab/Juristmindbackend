@@ -68,7 +68,7 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
     base_prompt += "\nNow, reason step by step:\n1. Restate what the user is asking in your own words, considering the chat context.\n2. Use your knowledge and any search results provided by the system to answer accurately.\n"
     
     if classification['use_sections_cases'] and is_case_with_sources:
-        base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 1 web source (e.g., legal databases), 1 news source (recent developments), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation.\n"
+        base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 2 web sources (e.g., legal databases), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation. Do not cite or mention X sources in your response.\n"
     elif classification['use_sections_cases']:
         base_prompt += "3. Structure for legal cases: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance).\n"
     elif classification['is_draft']:
@@ -97,6 +97,9 @@ def sanitize_response(response: str) -> str:
         (r'\bX\b', 'the platform'),
         (r'\bGrok-3\b', 'JuristMind'),
         (r'\bGrok 3\b', 'JuristMind'),
+        (r'\bGrok-4\b', 'JuristMind'),
+        (r'\bGrok 4\b', 'JuristMind'),
+        (r'\bGrok 4 Fast\b', 'JuristMind'),
         (r'\bcreated by xAI\b', 'developed by Oluwaseun Ogun'),
         (r'\bX\.com\b', 'the platform'),
         (r'\bX platform\b', 'the platform')
@@ -164,7 +167,7 @@ class QuestionRequest(BaseModel):
 
 # Query Grok API with retry (streaming generator) - Optimized for speed
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_exception_type(aiohttp.ClientError))
-async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None):
+async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None, model: str = "grok-3"):
     if not GROK_API_KEY:
         logger.error("Grok API key not set")
         yield {"type": "error", "message": "No API key set."}
@@ -178,7 +181,7 @@ async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None)
             }
             payload = {
                 "messages": messages,
-                "model": "grok-3",  # Use grok-3 for speed; switch to grok-4 if needed for Premium
+                "model": model,  # Dynamic model selection
                 "stream": True,
                 "temperature": 0.7,  # Balanced for legal accuracy
                 "max_tokens": 2000 if any(msg.get('role') == 'user' and 'draft' in msg['content'].lower() for msg in messages) else 1000,  # Higher for drafts
@@ -186,7 +189,7 @@ async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None)
             if search_params:
                 payload["search_parameters"] = search_params
 
-            logger.info(f"Sending Grok API request (search: {bool(search_params)})")
+            logger.info(f"Sending Grok API request with model {model} (search: {bool(search_params)})")
             async with client.post("https://api.x.ai/v1/chat/completions",
                                    headers=headers, json=payload,
                                    timeout=ClientTimeout(total=60)) as response:  # Shorter timeout for speed
@@ -284,9 +287,17 @@ async def ask_question(request: QuestionRequest):
 
     general_answer = handle_general_query(question)
     classification = classify_query(question)
+    q_lower = question.lower()
+
+    # Dynamic model selection
+    model = "grok-3"  # Default
+    if classification['intent'] in ['legal_case', 'general_legal']:  # For cases and solving questions
+        model = "grok-4"
+    if re.search(r'\b(think deep|think)\b', q_lower):
+        model = "grok-4-fast"  # Fast reasoning for deep thinks
 
     async def generate():
-        nonlocal general_answer, chat_id
+        nonlocal general_answer, chat_id, model
         full_text = ""
         citations = []
         has_error = False
@@ -340,36 +351,40 @@ async def ask_question(request: QuestionRequest):
                     yield f"data: {json.dumps({'content': sanitized_prefix})}\n\n"
                     full_text += sanitized_prefix
 
-            # Special handling for legal cases: Enable search with 2 sources (web, news, latest X via prompt)
+            # Special handling for legal cases: Enable search with 3 sources (2 web, 1 x)
             if classification['intent'] == 'legal_case':
+                max_results = 5 if re.search(r'\b(think deep|think)\b', q_lower) else 3  # More results for deep thinks
                 search_params = {
                     "mode": "auto",
                     "return_citations": True,
-                    "max_search_results": 2,  # Allow up to 2 for depth (1 web, 1 news, 1 X/news hybrid)
+                    "max_search_results": max_results,
                     "sources": [
                         {"type": "web"},  # 1. Web for legal facts
-                        {"type": "news"}   # 2. News for updates; Grok will incorporate latest X via search/prompt
+                        {"type": "web"},  # 2. Additional web
+                        {"type": "x"}     # 3. X for discussions (not cited)
                     ]
                 }
                 custom_prompt = build_reasoned_prompt(question, classification, history, is_case_with_sources=True)
                 messages[-1]["content"] = custom_prompt  # Override user content with full prompt
             else:
-                # Set search only if needed (for speed: max_results=1, focused sources)
+                # Set search only if needed (for speed: max_results=3, 2 web + 1 x)
                 if classification['needs_search']:
+                    max_results = 5 if re.search(r'\b(think deep|think)\b', q_lower) else 3  # More for deep thinks
                     search_params = {
                         "mode": "auto",
                         "return_citations": True,
-                        "max_search_results": 1,  # Minimal for speed
+                        "max_search_results": max_results,
                         "sources": [
                             {"type": "web"},  # Primary: Web for facts/cases
-                            {"type": "news"}   # Secondary: News for recent
+                            {"type": "web"},  # Secondary: Additional web
+                            {"type": "x"}     # Tertiary: X (not cited)
                         ]
                     }
                 custom_prompt = build_reasoned_prompt(question, classification, history)
                 messages[-1]["content"] = custom_prompt  # Override user content with full prompt
 
             # Stream response
-            async for item in query_grok(messages, search_params):
+            async for item in query_grok(messages, search_params, model):
                 if item["type"] == "content":
                     delta = item["delta"]
                     sanitized_delta = sanitize_response(delta)
@@ -387,15 +402,18 @@ async def ask_question(request: QuestionRequest):
             assistant_msg = {"role": "assistant", "content": full_text}
             history.append(assistant_msg)
 
-            # Add citations if available (but prompt hides source mentions)
+            # Add citations if available (but prompt hides source mentions; filter out X)
             if citations and not has_error:
                 # For cases, citations are internal; don't add to output to hide logic
                 if classification['intent'] != 'legal_case':
-                    source_str = "\n\nSources: " + "; ".join([str(c) for c in citations])
-                    sanitized_source = sanitize_response(source_str)
-                    yield f"data: {json.dumps({'content': sanitized_source})}\n\n"
-                    full_text += sanitized_source
-                    history[-1]["content"] += sanitized_source
+                    # Filter out X citations (assume citations are dicts with 'url' key)
+                    filtered_citations = [c for c in citations if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower()]
+                    if filtered_citations:
+                        source_str = "\n\nSources: " + "; ".join([str(c) for c in filtered_citations])
+                        sanitized_source = sanitize_response(source_str)
+                        yield f"data: {json.dumps({'content': sanitized_source})}\n\n"
+                        full_text += sanitized_source
+                        history[-1]["content"] += sanitized_source
 
             # Add suffix for drafts
             if 'suffix' in locals() and suffix and classification['is_draft'] and not has_error:
