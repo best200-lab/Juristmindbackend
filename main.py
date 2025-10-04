@@ -12,9 +12,9 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import aiohttp
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_fixed, wait_exponential, retry_if_exception_type
 from fastapi.middleware.cors import CORSMiddleware
-from aiohttp import ClientTimeout
+from aiohttp import ClientTimeout, TCPConnector
 
 # Simple regex-based classification (no NLTK for speed)
 def classify_query(query: str) -> Dict:
@@ -166,15 +166,23 @@ class QuestionRequest(BaseModel):
     chat_id: Optional[str] = None
 
 # Query Grok API with retry (streaming generator) - Optimized for speed
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_exception_type(aiohttp.ClientError))
-async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None, model: str = "grok-3"):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(aiohttp.ClientError))
+async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None, model: str = "grok-3", classification: Optional[Dict] = None):
     if not GROK_API_KEY:
         logger.error("Grok API key not set")
         yield {"type": "error", "message": "No API key set."}
         return
 
     try:
-        async with aiohttp.ClientSession() as client:
+        # Enhanced token limit based on intent
+        base_tokens = 1500  # Bump default
+        if any('draft' in msg.get('content', '').lower() for msg in messages if msg.get('role') == 'user'):
+            base_tokens = 4000
+        elif classification and classification.get('intent') in ['legal_case', 'general_legal']:
+            base_tokens = 3000
+        # For other intents, keep at 1500
+
+        async with aiohttp.ClientSession(connector=TCPConnector(limit=10, limit_per_host=5)) as client:
             headers = {
                 "Authorization": f"Bearer {GROK_API_KEY}",
                 "Content-Type": "application/json"
@@ -184,15 +192,22 @@ async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None,
                 "model": model,  # Dynamic model selection
                 "stream": True,
                 "temperature": 0.7,  # Balanced for legal accuracy
-                "max_tokens": 2000 if any(msg.get('role') == 'user' and 'draft' in msg['content'].lower() for msg in messages) else 1000,  # Higher for drafts
+                "max_tokens": base_tokens,
+                "return_citations": True,  # Ensure citations are enabled
             }
             if search_params:
                 payload["search_parameters"] = search_params
 
-            logger.info(f"Sending Grok API request with model {model} (search: {bool(search_params)})")
+            # Dynamic timeout
+            timeout_total = 120
+            if classification and classification.get('intent') in ['legal_case', 'draft']:
+                timeout_total = 180
+            timeout = ClientTimeout(total=timeout_total)
+
+            logger.info(f"Sending Grok API request with model {model} (search: {bool(search_params)}, max_tokens: {base_tokens})")
             async with client.post("https://api.x.ai/v1/chat/completions",
                                    headers=headers, json=payload,
-                                   timeout=ClientTimeout(total=60)) as response:  # Shorter timeout for speed
+                                   timeout=timeout) as response:
 
                 if response.status != 200:
                     text_data = await response.text()
@@ -205,9 +220,9 @@ async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None,
                 async for chunk in response.content.iter_any():
                     buffer += chunk.decode("utf-8")
 
-                    # Faster heartbeat (every 5s instead of 10)
+                    # Faster heartbeat (every 3s)
                     now = time.time()
-                    if now - last_yield_time > 5:
+                    if now - last_yield_time > 3:
                         yield {"type": "ping"}
                         last_yield_time = now
 
@@ -229,6 +244,10 @@ async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None,
                             if "choices" in json_data:
                                 delta = json_data["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
+                                finish_reason = json_data["choices"][0].get("finish_reason")
+                                if finish_reason == "length":
+                                    logger.warning("Response truncated due to max_tokens")
+                                    yield {"type": "warning", "message": "Response may be incomplete; consider follow-up for more details."}
                                 if content:
                                     yield {"type": "content", "delta": content}
                                     last_yield_time = time.time()
@@ -243,10 +262,15 @@ async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None,
                         if "choices" in json_data:
                             delta = json_data["choices"][0].get("delta", {})
                             content = delta.get("content", "")
+                            finish_reason = json_data["choices"][0].get("finish_reason")
+                            if finish_reason == "length":
+                                logger.warning("Response truncated due to max_tokens")
+                                yield {"type": "warning", "message": "Response may be incomplete; consider follow-up for more details."}
                             if content:
                                 yield {"type": "content", "delta": content}
                     except json.JSONDecodeError:
                         pass
+                logger.info(f"Stream ended with buffer len: {len(buffer)}")
 
     except aiohttp.ClientError as e:
         logger.exception(f"Grok API request failed: {e}")
@@ -370,28 +394,37 @@ async def ask_question(request: QuestionRequest):
             else:
                 # Set search only if needed (including for drafts now; fixed at 3 results)
                 if classification['needs_search'] or classification['is_draft']:
-                    search_params = {
-                        "mode": "auto",
-                        "return_citations": True,
-                        "max_search_results": 3,  # Fixed at 3
-                        "sources": [
-                            {"type": "web"},   # Primary: General web
-                            {"type": "news"},  # Secondary: News websites
-                            {"type": "x"}      # Tertiary: X (not cited)
-                        ]
-                    }
+                    if classification['intent'] == 'legal_case':
+                        # Already handled above
+                        pass
+                    else:
+                        # Lighter search: web+news only, max=2
+                        search_params = {
+                            "mode": "auto",
+                            "return_citations": True,
+                            "max_search_results": 2,
+                            "sources": [
+                                {"type": "web"},   # Primary: General web
+                                {"type": "news"}   # Secondary: News websites
+                            ]
+                        }
                 custom_prompt = build_reasoned_prompt(question, classification, history)
                 messages[-1]["content"] = custom_prompt  # Override user content with full prompt
 
             # Stream response
-            async for item in query_grok(messages, search_params, model):
+            async for item in query_grok(messages, search_params, model, classification):
                 if item["type"] == "content":
                     delta = item["delta"]
                     sanitized_delta = sanitize_response(delta)
+                    logger.info(f"Yielded {len(delta)} chars; total so far: {len(full_text)}")
                     yield f"data: {json.dumps({'content': sanitized_delta})}\n\n"
                     full_text += sanitized_delta
                 elif item["type"] == "citations":
                     citations = item["data"]
+                elif item["type"] == "warning":
+                    warning_msg = item["message"]
+                    yield f"data: {json.dumps({'content': warning_msg})}\n\n"
+                    full_text += warning_msg
                 elif item["type"] == "error":
                     has_error = True
                     error_msg = "[Error] " + item["message"]
