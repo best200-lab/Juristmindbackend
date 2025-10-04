@@ -68,15 +68,15 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
     base_prompt += "\nNow, reason step by step:\n1. Restate what the user is asking in your own words, considering the chat context.\n2. Use your knowledge and any search results provided by the system to answer accurately.\n"
     
     if classification['use_sections_cases'] and is_case_with_sources:
-        base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 2 web sources (e.g., legal databases), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation. Do not cite or mention X sources in your response.\n"
+        base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 2 web sources (e.g., legal databases), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome). Take time to verify: Only cite cases/statutes if you are 100% certain they directly align with the query (high confidence based on exact matches in search results)—no patching or out-of-context refs. If uncertain, omit citations and state 'Further manual research recommended via LPELR/NWLR.' Back up only with 2+ verifiable Nigerian sections/laws (quote briefly, explain relevance verbatim from sources). Discuss recent developments only if directly relevant. Do not cite or mention X sources.\n"
     elif classification['use_sections_cases']:
-        base_prompt += "3. Structure for legal cases: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance).\n"
+        base_prompt += "3. Structure for legal cases: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome). Take time to verify: Only cite cases/statutes if 100% certain they directly align (high confidence)—no fabrication or patching. If uncertain, omit and state 'Further manual research recommended.' Back up only with 2+ verifiable Nigerian sections/laws (quote briefly, explain relevance).\n"
     elif classification['is_draft']:
-        base_prompt += "3. Take your time to craft a very detailed, professional, irresistible, and perfect draft tailored to Nigerian legal standards. Make it comprehensive, with precise language, all necessary clauses, and impeccable structure. At the end, reference and state the relevant sections of the law that underpin the draft.\n"
+        base_prompt += "3. Take your time to craft a very detailed, professional, irresistible, and perfect draft tailored to Nigerian legal standards. Make it comprehensive, with precise language, all necessary clauses, and impeccable structure. Only reference sections/laws if 100% certain and relevant (high confidence from knowledge/search)—no uncertain citations; if needed, note 'Verify with latest gazette.' At the end, reference only verifiable sections of the law that underpin the draft.\n"
     else:
-        base_prompt += "3. Provide a clear, factual, and helpful answer.\n"
+        base_prompt += "3. Provide a clear, factual, and helpful answer. Only cite laws/cases if 100% certain and directly relevant—no out-of-context or patched info. If uncertain, say so and suggest manual check.\n"
     
-    base_prompt += "4. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. Do not mention sources, reasoning, or search processes in the response."
+    base_prompt += "4. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. Mention key sources inline if they directly support claims (e.g., 'Per LPELR-XXXX')."
     
     return base_prompt
 
@@ -402,18 +402,16 @@ async def ask_question(request: QuestionRequest):
             assistant_msg = {"role": "assistant", "content": full_text}
             history.append(assistant_msg)
 
-            # Add citations if available (but prompt hides source mentions; filter out X)
+            # Add citations if available—for ALL intents now (including legal_case), to ensure transparency
             if citations and not has_error:
-                # For cases, citations are internal; don't add to output to hide logic
-                if classification['intent'] != 'legal_case':
-                    # Filter out X citations (assume citations are dicts with 'url' key)
-                    filtered_citations = [c for c in citations if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower()]
-                    if filtered_citations:
-                        source_str = "\n\nSources: " + "; ".join([str(c) for c in filtered_citations])
-                        sanitized_source = sanitize_response(source_str)
-                        yield f"data: {json.dumps({'content': sanitized_source})}\n\n"
-                        full_text += sanitized_source
-                        history[-1]["content"] += sanitized_source
+                # Filter out X citations (assume citations are dicts with 'url' key)
+                filtered_citations = [c for c in citations if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower()]
+                if filtered_citations:
+                    source_str = "\n\nSources Used:\n" + "\n".join([f"{i+1}. {c.get('title', 'Untitled')} ({c.get('url', '#')}) - Snippet: {c.get('snippet', 'N/A')[:100]}..." for i, c in enumerate(filtered_citations)])
+                    sanitized_source = sanitize_response(source_str)
+                    yield f"data: {json.dumps({'content': sanitized_source})}\n\n"
+                    full_text += sanitized_source
+                    history[-1]["content"] += sanitized_source
 
             # Add suffix for drafts
             if 'suffix' in locals() and suffix and classification['is_draft'] and not has_error:
