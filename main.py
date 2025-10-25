@@ -7,7 +7,7 @@ import uuid
 import time
 from typing import Dict, Optional, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -15,6 +15,10 @@ import aiohttp
 from tenacity import retry, stop_after_attempt, wait_fixed, wait_exponential, retry_if_exception_type
 from fastapi.middleware.cors import CORSMiddleware
 from aiohttp import ClientTimeout, TCPConnector
+import io
+from fastapi import UploadFile
+import PyPDF2
+import docx
 
 # Simple regex-based classification (no NLTK for speed)
 def classify_query(query: str) -> Dict:
@@ -54,10 +58,11 @@ def classify_query(query: str) -> Dict:
     
     return classification
 
-def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[Dict] = None, is_case_with_sources: bool = False) -> str:
+def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[Dict] = None, is_case_with_sources: bool = False, document_texts: List[str] = None) -> str:
     """
     Build a structured prompt that enforces reasoning. For cases, include instructions for at least 2 legal sections and detailed facts.
     For drafts, emphasize detailed, professional drafting. Include chat history for context.
+    If documents are provided, include instructions to analyze them.
     """
     history_context = ""
     if chat_history:
@@ -66,6 +71,9 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
     base_prompt = f"User query: {query}\n{history_context}\n\nFirst, understand the user's intent: They want information on {classification['intent']} related to Nigerian law where applicable. Follow the chat trend.\n"
     
     base_prompt += "\nNow, reason step by step:\n1. Restate what the user is asking in your own words, considering the chat context.\n2. Use your knowledge and any search results provided by the system to answer accurately.\n"
+    
+    if document_texts:
+        base_prompt += "\nAnalyze and incorporate the following attached documents in your response:\n" + "\n\n".join(document_texts) + "\n"
     
     if classification['use_sections_cases'] and is_case_with_sources:
         base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 2 web sources (e.g., legal databases), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation. Do not cite or mention X sources in your response.\n"
@@ -139,6 +147,32 @@ def save_chat_history(chat_id: str, history: List[Dict]):
     with open(f"public/chats/{chat_id}.json", "w") as f:
         json.dump({"id": chat_id, "history": history}, f, indent=2)
 
+async def extract_document_text(file: UploadFile) -> str:
+    """
+    Extract text from uploaded document based on file type.
+    """
+    contents = await file.read()
+    filename = file.filename.lower()
+    try:
+        if filename.endswith('.pdf'):
+            reader = PyPDF2.PdfReader(io.BytesIO(contents))
+            text = ''
+            for page in reader.pages:
+                text += page.extract_text() + '\n'
+        elif filename.endswith('.docx') or filename.endswith('.doc'):
+            doc = docx.Document(io.BytesIO(contents))
+            text = ''
+            for para in doc.paragraphs:
+                text += para.text + '\n'
+        elif filename.endswith('.txt'):
+            text = contents.decode('utf-8')
+        else:
+            text = ''
+        return f"Document '{file.filename}':\n{text}\n"
+    except Exception as e:
+        logger.error(f"Error extracting text from {file.filename}: {e}")
+        return f"Document '{file.filename}': [Error extracting text]\n"
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -159,11 +193,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Pydantic model for request body
-class QuestionRequest(BaseModel):
-    question: str
-    chat_id: Optional[str] = None
 
 # Query Grok API with retry (streaming generator) - Optimized for speed
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(aiohttp.ClientError))
@@ -300,14 +329,26 @@ async def favicon():
 
 @app.get("/ask")
 async def ask_question_get():
-    return JSONResponse({"message": "Please use a POST request to /ask with a JSON body containing your question and optional chat_id."})
+    return JSONResponse({"message": "Please use a POST request to /ask with a form body containing your question, optional chat_id, user_id, and files."})
 
 @app.post("/ask")
-async def ask_question(request: QuestionRequest):
-    question = request.question.strip()
-    chat_id = request.chat_id
-    if not question:
-        return JSONResponse({"answer": "Question cannot be empty"})
+async def ask_question(request: Request):
+    form = await request.form()
+    question = form.get("question", "").strip()
+    chat_id = form.get("chat_id")
+    user_id = form.get("user_id")  # Not used currently, but captured
+    files = form.getlist("files")
+
+    if not question and not files:
+        return JSONResponse({"answer": "Question or files cannot be empty"})
+
+    # Extract document texts if files are uploaded
+    document_texts = []
+    if files:
+        for file in files:
+            if isinstance(file, UploadFile):
+                doc_text = await extract_document_text(file)
+                document_texts.append(doc_text)
 
     general_answer = handle_general_query(question)
     classification = classify_query(question)
@@ -315,8 +356,8 @@ async def ask_question(request: QuestionRequest):
 
     # Dynamic model selection
     model = "grok-3"  # Default
-    if classification['intent'] == 'draft':
-        model = "grok-4-fast"  # Grok-4-fast for all drafts
+    if classification['intent'] == 'draft' or document_texts:  # Use grok-4 for drafts or document analysis
+        model = "grok-4-fast"
     elif classification['intent'] in ['legal_case', 'general_legal']:  # For cases and solving questions
         model = "grok-4"
     if re.search(r'\b(think deep|think)\b', q_lower):
@@ -348,8 +389,11 @@ async def ask_question(request: QuestionRequest):
         # Add system prompt
         messages.insert(0, {"role": "system", "content": "You are JuristMind, a logical legal AI specializing in Nigerian law. Always reason before answering and quote both  specific statutes and cases applicable in your responses."})
 
-        # Append user question
-        user_msg = {"role": "user", "content": question}
+        # Append user question (include file mentions if any)
+        user_content = question
+        if document_texts:
+            user_content += "\n\nAttached documents for analysis."
+        user_msg = {"role": "user", "content": user_content}
         messages.append(user_msg)
         history.append(user_msg)
 
@@ -389,7 +433,7 @@ async def ask_question(request: QuestionRequest):
                         {"type": "x"}      # 3. X for discussions (not cited)
                     ]
                 }
-                custom_prompt = build_reasoned_prompt(question, classification, history, is_case_with_sources=True)
+                custom_prompt = build_reasoned_prompt(question, classification, history, is_case_with_sources=True, document_texts=document_texts)
                 messages[-1]["content"] = custom_prompt  # Override user content with full prompt
             else:
                 # Set search only if needed (including for drafts now; fixed at 3 results)
@@ -408,7 +452,7 @@ async def ask_question(request: QuestionRequest):
                                 {"type": "news"}   # Secondary: News websites
                             ]
                         }
-                custom_prompt = build_reasoned_prompt(question, classification, history)
+                custom_prompt = build_reasoned_prompt(question, classification, history, document_texts=document_texts)
                 messages[-1]["content"] = custom_prompt  # Override user content with full prompt
 
             # Stream response
@@ -435,19 +479,6 @@ async def ask_question(request: QuestionRequest):
             assistant_msg = {"role": "assistant", "content": full_text}
             history.append(assistant_msg)
 
-            # Add citations if available (but prompt hides source mentions; filter out X)
-            if citations and not has_error:
-                # For cases, citations are internal; don't add to output to hide logic
-                if classification['intent'] != 'legal_case':
-                    # Filter out X citations (assume citations are dicts with 'url' key)
-                    filtered_citations = [c for c in citations if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower()]
-                    if filtered_citations:
-                        source_str = "\n\nSources: " + "; ".join([str(c) for c in filtered_citations])
-                        sanitized_source = sanitize_response(source_str)
-                        yield f"data: {json.dumps({'content': sanitized_source})}\n\n"
-                        full_text += sanitized_source
-                        history[-1]["content"] += sanitized_source
-
             # Add suffix for drafts
             if 'suffix' in locals() and suffix and classification['is_draft'] and not has_error:
                 sanitized_suffix = sanitize_response(suffix)
@@ -458,9 +489,20 @@ async def ask_question(request: QuestionRequest):
         if not has_error:
             logger.info("Processing complete, storing chat.")
             save_chat_history(chat_id, history)
+
+        # Prepare sources from citations (filter out X)
+        sources = []
+        if citations:
+            for c in citations:
+                if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower():
+                    sources.append({
+                        "title": c.get("title", c.get("url", "")),
+                        "url": c.get("url", "")
+                    })
+
         chat_url = f"{BASE_CHAT_URL}/public/chats/{chat_id}.json"
         logger.info(f"Chat stored at: {chat_url}")
-        yield f"data: {json.dumps({'type': 'done', 'chat_id': chat_id, 'chat_url': chat_url})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'chat_id': chat_id, 'chat_url': chat_url, 'sources': sources})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
