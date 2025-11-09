@@ -78,6 +78,9 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
    
     base_prompt += "\nNow, reason step by step:\n1. Use your knowledge and any search results provided by the system to answer accurately.\n"
    
+    if document_texts or has_images:
+        base_prompt += "\nThe user has attached documents and/or images; always analyze them to answer the query, even if not explicitly mentioned in the query.\n"
+   
     if document_texts:
         base_prompt += "\nAnalyze and incorporate the following attached documents in your response:\n" + "\n\n".join(document_texts) + "\n"
    
@@ -85,7 +88,7 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
         base_prompt += "\nAnalyze the attached images, recognize any text within them using OCR-like capabilities, describe the visual content, and incorporate that into your response to answer the query accordingly.\n"
    
     if classification['intent'] == 'law_project':
-        base_prompt += "2. For this law project, generate section by section in detail. Start with Title, Abstract, Table of Contents as the first section if not already generated. For subsequent sections, generate one at a time based on the user's request or the next logical chapter. Use markdown for formatting: # for main titles, ## for subsections, bullet points for Table of Contents. Use OSCOLA referencing style for all citations: footnotes for in-text references (e.g., party v party [year] report, pinpoint), and a full bibliography at the end of the complete project. Follow OSCOLA rules for cases, statutes (title (date) series), books, journals, and websites. Use at most 3 relevant sources (Nigerian laws, cases, journals) per section, fewer if not needed. If project details are missing from context, ask for planning: topic, number of chapters (default 5), key objectives, research questions. Structure chapters typically as: Introduction, Literature Review, Methodology, Main Analysis (multiple chapters), Findings/Discussion, Conclusion, Recommendations. Ensure original, academic tone tailored to Nigerian law.\n"
+        base_prompt += "2. For this law project, generate section by section in detail. If the title is missing from context, first ask for the title of the project. Then, ask for other details like number of chapters (default 5), key objectives, research questions if needed. Start with Title, Abstract, Table of Contents as the first section if not already generated. For subsequent sections, generate one at a time based on the user's request or the next logical chapter. Use markdown for formatting: # for main titles, ## for subsections, bullet points for Table of Contents. Use OSCOLA referencing style for all citations: footnotes for in-text references (e.g., party v party [year] report, pinpoint), and a full bibliography at the end of the complete project. Follow OSCOLA rules for cases, statutes (title (date) series), books, journals, and websites. Use at most 3 relevant sources (Nigerian laws, cases, journals) per section, fewer if not needed. Structure chapters typically as: Introduction, Literature Review, Methodology, Main Analysis (multiple chapters), Findings/Discussion, Conclusion, Recommendations. Ensure original, academic tone tailored to Nigerian law.\n"
     elif classification['use_sections_cases'] and is_case_with_sources:
         if classification['is_fact_specific']:
             base_prompt += "2. For this fact-specific query, emphasize detailed facts: 1) Parties involved, key events in chronological order with specifics; 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); draw from up to 3 sources for accuracy. Discuss how recent discussions impact interpretation. Do not cite or mention X sources in your response.\n"
@@ -101,7 +104,7 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
     else:
         base_prompt += "2. Provide a clear, factual, and helpful answer. If applicable to law, back it up with provisions from Nigerian statutes or cases.\n"
    
-    base_prompt += "3. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?', 'What is the next section for your project?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. Always mention and cite sources at the end of your response (e.g., 'Sources: [list them]')."
+    base_prompt += "3. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?', 'What is the next section for your project?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. If relevant sources are available, mention and cite them at the end; otherwise, do not."
    
     return base_prompt
 
@@ -517,9 +520,9 @@ async def ask_question(request: Request):
         if not has_error:
             logger.info("Processing complete, storing chat.")
             save_chat_history(chat_id, history)
-        # Prepare sources from citations (filter out X) and append if not in content
+        # Prepare sources from citations (filter out X) and append if not in content and search was performed
         sources = []
-        if citations:
+        if citations and search_params is not None:
             for c in citations:
                 if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower():
                     sources.append({
