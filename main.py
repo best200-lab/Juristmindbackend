@@ -6,7 +6,7 @@ import re
 import uuid
 import time
 from typing import Dict, Optional, List
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -102,9 +102,9 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
     elif classification['is_draft']:
         base_prompt += "2. Take your time to craft a very detailed, professional, irresistible, and perfect draft tailored to Nigerian legal standards. Make it comprehensive, with precise language, all necessary clauses, and impeccable structure. At the end, reference and state the relevant sections of the law that underpin the draft.\n"
     else:
-        base_prompt += "2. Provide a clear, factual, and helpful answer. If applicable to law, back it up with provisions from Nigerian statutes or cases.\n"
+        base_prompt += "2. Provide a clear, factual, and helpful answer. If applicable to law, back up with provisions from Nigerian statutes or cases.\n"
    
-    base_prompt += "3. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?', 'What is the next section for your project?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. If relevant sources are available, mention and cite them at the end; otherwise, do not."
+    base_prompt += "3. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?', 'What is the next section for your project?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. If relevant sources are available, cite them inline using [1], [2], etc., at the exact point in the body, and provide footnotes or a references section at the end with full details including links."
    
     return base_prompt
 
