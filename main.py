@@ -15,20 +15,32 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from fastapi.middleware.cors import CORSMiddleware
 from aiohttp import ClientTimeout, TCPConnector
 
-# Simple regex-based classification (no NLTK for speed)
+# ==================== CONFIG & LOGGING ====================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+load_dotenv()
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+BASE_CHAT_URL = os.getenv("BASE_CHAT_URL", "https://juristmind.onrender.com")
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==================== CLASSIFICATION (UNCHANGED) ====================
 def classify_query(query: str) -> Dict:
-    """
-    Fast regex/keyword-based classification without external libs.
-    """
     q_lower = query.lower()
-  
-    # Keyword detection
     legal_keywords = ['case', 'law', 'statute', 'section', 'court', 'decision', 'ruling', 'legal', 'jurisdiction', 'precedent']
     simple_keywords = ['what is', 'define', 'explain']
     entity_keywords = ['who is', 'where is', 'what about']
     draft_keywords = ['draft', 'write', 'template']
     fact_keywords = ['facts', 'details', 'events', 'parties', 'outcome', 'chronology']
-  
+
     is_legal = any(re.search(rf'\b{re.escape(kw)}\b', q_lower) for kw in legal_keywords)
     is_case_specific = any(re.search(rf'\b{re.escape(kw)}\b', q_lower) for kw in ['case', 'section'])
     is_fact_specific = is_case_specific and any(re.search(rf'\b{re.escape(kw)}\b', q_lower) for kw in fact_keywords)
@@ -36,7 +48,7 @@ def classify_query(query: str) -> Dict:
     is_entity = any(re.search(rf'\b{re.escape(kw)}\b', q_lower) for kw in entity_keywords)
     is_draft = any(re.search(rf'\b{re.escape(kw)}\b', q_lower) for kw in draft_keywords)
     requires_search = len(query.split()) > 5 or any(re.search(rf'\b{re.escape(kw)}\b', q_lower) for kw in ['current', 'latest', 'recent', 'nigerian'])
-  
+
     classification = {
         'intent': 'simple_non_law' if is_simple_non_law else
                   'entity_query' if is_entity else
@@ -49,21 +61,14 @@ def classify_query(query: str) -> Dict:
         'is_draft': is_draft,
         'is_fact_specific': is_fact_specific
     }
-  
-    logger = logging.getLogger(__name__)
     logger.info(f"Query classification: {classification}")
-  
     return classification
 
+# ==================== PROMPT BUILDER (UNCHANGED) ====================
 def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[Dict] = None, is_case_with_sources: bool = False) -> str:
-    """
-    Build a structured prompt that enforces reasoning. For cases, include instructions for at least 2 legal sections and detailed facts.
-    For drafts, emphasize detailed, professional drafting. Include chat history for context.
-    """
     base_prompt = f"User query: {query}\n\nFirst, understand the user's intent: They want information on {classification['intent']} related to Nigerian law where applicable. Follow the chat trend.\n"
-  
     base_prompt += "\nNow, reason step by step:\n1. Use your knowledge and any search results provided by the system to answer accurately.\n"
-  
+
     if classification['intent'] == 'legal_case' and is_case_with_sources:
         base_prompt += "3. For this legal case, draw from 3 sources for accuracy: 2 web sources (e.g., legal databases), and latest posts from X (social media discussions, sorted by latest). Structure: 1) Detailed facts (parties involved, key events in chronological order with specifics); 2) Main legal issues; 3) Court decision (direct quote if possible, outcome); 4) Back up with at least 2 specific Nigerian sections/laws (quote them briefly and explain relevance); discuss how recent discussions impact interpretation. Do not cite or mention X sources in your response.\n"
     elif classification['use_sections_cases']:
@@ -72,368 +77,331 @@ def build_reasoned_prompt(query: str, classification: Dict, chat_history: List[D
         base_prompt += "3. Take your time to craft a very detailed, professional, irresistible, and perfect draft tailored to Nigerian legal standards. Make it comprehensive, with precise language, all necessary clauses, and impeccable structure. At the end, reference and state the relevant sections of the law that underpin the draft.\n"
     else:
         base_prompt += "3. Provide a clear, factual, and helpful answer.\n"
-    
+   
     base_prompt += "4. End with a helpful suggestion for follow-up, phrased to assist the user (e.g., 'Would you like me to explain further?', 'Should I draft a related document?').\n\nRespond thoughtfully as JuristMind, specializing in Nigerian law. Keep it concise yet comprehensive where needed. If relevant sources are available, cite them inline using [1], [2], etc., at the exact point in the body, and provide footnotes or a references section at the end with full details including links."
-    
-    return base_prompt         
+    return base_prompt
 
-# General answers for common queries
-GENERAL_ANSWERS = {
-    "what is your name": "I am JuristMind, your AI legal assistant.",
-    "who created you": "I was developed by Oluwaseun Ogun to assist with legal research and explanations.",
-    "how old are you": "I do not have an age, but I was launched recently to assist with legal and general inquiries."
-}
-
+# ==================== SANITIZE & GENERAL ANSWERS ====================
 def sanitize_response(response: str) -> str:
-    """
-    Remove or replace references to Grok, xAI, or X in the response.
-    """
     patterns = [
-        (r'\bGrok\b', 'JuristMind'),
-        (r'\bxAI\b', 'the developers'),
-        (r'\bX\b', 'the platform'),
-        (r'\bGrok-3\b', 'JuristMind'),
-        (r'\bGrok 3\b', 'JuristMind'),
-        (r'\bGrok-4\b', 'JuristMind'),
-        (r'\bGrok 4\b', 'JuristMind'),
-        (r'\bGrok 4 Fast\b', 'JuristMind'),
-        (r'\bcreated by xAI\b', 'developed by Oluwaseun Ogun'),
-        (r'\bX\.com\b', 'the platform'),
-        (r'\bX platform\b', 'the platform')
+        (r'\bGrok\b', 'JuristMind'), (r'\bxAI\b', 'the developers'), (r'\bX\b', 'the platform'),
+        (r'\bGrok-?3\b', 'JuristMind'), (r'\bGrok-?4\b', 'JuristMind'), (r'\bGrok 4 Fast\b', 'JuristMind'),
+        (r'\bcreated by xAI\b', 'developed by Oluwaseun Ogun'), (r'\bX\.com\b', 'the platform')
     ]
-  
     sanitized = response
     for pattern, replacement in patterns:
         sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
-  
     return sanitized
 
-def handle_general_query(question: str) -> Optional[str]:
-    """
-    Handle predefined general queries.
-    """
+# Expanded instant responses (ZERO API cost)
+INSTANT_RESPONSES = {
+    "hello": "Hello! I'm JuristMind, your Nigerian law specialist. How can I assist you today?",
+    "hi": "Hi there! Ready to help with any legal question.",
+    "thank you": "You're very welcome! Happy to help anytime.",
+    "thanks": "My pleasure! Anything else?",
+    "good morning": "Good morning! How can I assist you today?",
+    "good afternoon": "Good afternoon! Ready when you are.",
+    "good evening": "Good evening! How may I help?",
+    "ok": "Alright! Let me know if you need anything else.",
+    "continue": "Yes, please go ahead — I'm listening.",
+    "bye": "Goodbye! Feel free to return anytime.",
+}
+
+def handle_instant_query(question: str) -> Optional[str]:
     q = question.lower().strip()
-    for key in GENERAL_ANSWERS:
-        if key in q:
-            return GENERAL_ANSWERS[key]
+    for trigger, response in INSTANT_RESPONSES.items():
+        if trigger in q:
+            return response
+    # Simple definitions or explanations without deep context
+    if re.match(r'^(what is|define|explain briefly)\s', q):
+        if any(word in q for word in ['section', 'act', 'constitution', 'evidence act', 'criminal code', 'penal code']):
+            return None  # Let model handle legal sections
+        return None  # For now, let model handle others
     return None
 
-def load_chat_history(chat_id: str) -> Optional[Dict]:
-    """
-    Load chat history from file.
-    """
+# ==================== CHAT HISTORY IO ====================
+def load_chat_history(chat_id: str) -> Optional[List[Dict]]:
     try:
         with open(f"public/chats/{chat_id}.json", "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data.get("history", [])
     except FileNotFoundError:
         return None
 
 def save_chat_history(chat_id: str, history: List[Dict]):
-    """
-    Save chat history to file.
-    """
     os.makedirs("public/chats", exist_ok=True)
     with open(f"public/chats/{chat_id}.json", "w") as f:
         json.dump({"id": chat_id, "history": history}, f, indent=2)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# ==================== SUMMARIZATION WITH GROK-3 (CHEAP) ====================
+async def summarize_history(history: List[Dict]) -> str:
+    if len(history) < 6:
+        return ""
+    
+    past_messages = history[:-4]  # Everything except last 4 messages
+    text_to_summarize = "\n".join([
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:500]}"
+        for m in past_messages
+    ])
 
-# Load environment variables
-load_dotenv()
-GROK_API_KEY = os.getenv("GROK_API_KEY")
+    summary_prompt = f"""Summarize the key points and ongoing context from this conversation in 2-3 concise paragraphs. 
+Focus on unresolved questions, user's goals, legal topics discussed, and any facts mentioned.
+Do not say "previous conversation" or meta comments. Write as if continuing naturally.
 
-# Base URL for chat storage
-BASE_CHAT_URL = os.getenv("BASE_CHAT_URL", "https://juristmind.onrender.com")
+Conversation:
+{text_to_summarize}
 
-app = FastAPI()
+Summary:"""
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    messages = [
+        {"role": "system", "content": "You are a concise summarizer."},
+        {"role": "user", "content": summary_prompt}
+    ]
 
-# Query Grok API with retry (streaming generator) - Optimized for speed
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(aiohttp.ClientError))
-async def query_grok(messages: List[Dict], search_params: Optional[Dict] = None, model: str = "grok-3", classification: Optional[Dict] = None):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "grok-3", "messages": messages, "max_tokens": 600, "temperature": 0.3},
+                timeout=ClientTimeout(total=60)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"].strip()
+    except:
+        pass
+    return "Previous conversation context was summarized for efficiency."
+
+# ==================== GROK QUERY (REUSABLE) ====================
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+async def query_grok_stream(messages: List[Dict], search_params: Optional[Dict], model: str, classification: Dict):
     if not GROK_API_KEY:
-        logger.error("Grok API key not set")
-        yield {"type": "error", "message": "No API key set."}
+        yield {"type": "error", "message": "API key missing"}
         return
 
-    try:
-        # Enhanced token limit based on intent
-        base_tokens = 1500
-        if classification:
-            if classification.get('intent') == 'draft':
-                base_tokens = 4000
-            elif classification.get('intent') in ['legal_case', 'general_legal']:
-                base_tokens = 3000
+    base_tokens = {"grok-3": 4000, "grok-4-fast": 8000, "grok-4": 12000}.get(model, 6000)
+    if classification.get('is_draft'):
+        base_tokens = 12000 if 'fast' in model else 16000
 
-        async with aiohttp.ClientSession(connector=TCPConnector(limit=10, limit_per_host=5)) as client:
-            headers = {
-                "Authorization": f"Bearer {GROK_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "messages": messages,
-                "model": model,
-                "stream": True,
-                "temperature": 0.7,
-                "max_tokens": base_tokens,
-                "return_citations": True,
-            }
-            if search_params:
-                payload["search_parameters"] = search_params
+    async with aiohttp.ClientSession(connector=TCPConnector(limit=10)) as client:
+        payload = {
+            "messages": messages,
+            "model": model,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": base_tokens,
+            "return_citations": True,
+        }
+        if search_params:
+            payload["search_parameters"] = search_params
 
-            timeout_total = 120
-            if classification and classification.get('intent') in ['legal_case', 'draft']:
-                timeout_total = 180
-            timeout = ClientTimeout(total=timeout_total)
+        timeout = ClientTimeout(total=180 if 'draft' in classification.get('intent', '') or classification.get('intent') == 'legal_case' else 120)
 
-            logger.info(f"Sending Grok API request with model {model} (search: {bool(search_params)}, max_tokens: {base_tokens})")
-            async with client.post("https://api.x.ai/v1/chat/completions",
-                                   headers=headers, json=payload,
-                                   timeout=timeout) as response:
-                if response.status != 200:
-                    text_data = await response.text()
-                    yield {"type": "error", "message": f"API error: {text_data}"}
-                    return
+        async with client.post("https://api.x.ai/v1/chat/completions", headers={
+            "Authorization": f"Bearer {GROK_API_KEY}",
+            "Content-Type": "application/json"
+        }, json=payload, timeout=timeout) as response:
 
-                buffer = ""
-                last_yield_time = time.time()
-                async for chunk in response.content.iter_any():
-                    buffer += chunk.decode("utf-8")
-                    now = time.time()
-                    if now - last_yield_time > 3:
-                        yield {"type": "ping"}
-                        last_yield_time = now
+            if response.status != 200:
+                yield {"type": "error", "message": await response.text()}
+                return
 
-                    while "\n\n" in buffer:
-                        event, buffer = buffer.split("\n\n", 1)
-                        for line in event.split("\n"):
-                            if not line.startswith("data: "):
-                                continue
-                            data = line[6:].strip()
-                            if data == "[DONE]":
-                                return
-                            try:
-                                json_data = json.loads(data)
-                            except json.JSONDecodeError:
-                                break
+            buffer = ""
+            last_yield = time.time()
+            async for chunk in response.content.iter_any():
+                buffer += chunk.decode("utf-8", errors="ignore")
+                now = time.time()
+                if now - last_yield > 3:
+                    yield {"type": "ping"}
+                    last_yield = now
 
-                            if "choices" in json_data:
-                                delta = json_data["choices"][0].get("delta", {})
+                while "\n\n" in buffer:
+                    event, buffer = buffer.split("\n\n", 1)
+                    for line in event.split("\n"):
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            js = json.loads(data)
+                            if "choices" in js:
+                                delta = js["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
-                                finish_reason = json_data["choices"][0].get("finish_reason")
-                                if finish_reason == "length":
-                                    yield {"type": "warning", "message": "Response may be incomplete; consider follow-up for more details."}
                                 if content:
                                     yield {"type": "content", "delta": content}
-                                    last_yield_time = time.time()
-                            if "citations" in json_data:
-                                yield {"type": "citations", "data": json_data["citations"]}
+                                if js["choices"][0].get("finish_reason") == "length":
+                                    yield {"type": "warning", "message": "Response truncated due to length."}
+                            if "citations" in js:
+                                yield {"type": "citations", "data": js["citations"]}
+                        except:
+                            continue
 
-                if buffer.strip():
-                    try:
-                        json_data = json.loads(buffer.strip())
-                        if "choices" in json_data:
-                            delta = json_data["choices"][0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                yield {"type": "content", "delta": content}
-                    except json.JSONDecodeError:
-                        pass
-
-    except aiohttp.ClientError as e:
-        logger.exception(f"Grok API request failed: {e}")
-        yield {"type": "error", "message": str(e)}
-
-# Load legal document template
-def load_template(template_name: str):
-    try:
-        with open(f"templates/{template_name}.txt", "r", encoding="utf-8") as f:
-            return f.read()
-    except UnicodeDecodeError:
-        with open(f"templates/{template_name}.txt", "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.warning(f"Template {template_name} not found, using default.")
-        return f"Default template for {template_name}. Insert your content here: {{content}}"
-
-@app.get("/")
-async def root():
-    return JSONResponse({"message": "Welcome to JuristMind, your AI legal assistant for Nigerian law!"})
-
-@app.get("/favicon.ico")
-async def favicon():
-    return FileResponse("static/favicon.ico", media_type="image/x-icon")
-
+# ==================== MAIN ENDPOINT ====================
 @app.post("/ask")
 async def ask_question(request: Request):
     form = await request.form()
     question = form.get("question", "").strip()
     chat_id = form.get("chat_id")
-    user_id = form.get("user_id")
-
     if not question:
         return JSONResponse({"answer": "Question cannot be empty"})
 
-    general_answer = handle_general_query(question)
     classification = classify_query(question)
-    q_lower = question.lower()
 
-    # Dynamic model selection
-    model = "grok-3"
-    if classification['intent'] == 'draft':
-        model = "grok-4-fast"
-    elif classification['intent'] in ['legal_case', 'general_legal']:
-        model = "grok-4"
+    # === INSTANT RESPONSE (0 tokens) ===
+    instant = handle_instant_query(question)
+    if instant:
+        if not chat_id:
+            chat_id = str(uuid.uuid4())
+        history = load_chat_history(chat_id) or []
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": instant})
+        save_chat_history(chat_id, history)
+        return StreamingResponse(
+            (f"data: {json.dumps({'content': instant + '\n\n'})}\n\n" +
+             f"data: {json.dumps({'type': 'done', 'chat_id': chat_id, 'sources': []})}\n\n").split("\n\n"),
+            media_type="text/event-stream"
+        )
 
-    if re.search(r'\b(think deep|think)\b', q_lower):
-        model = "grok-4-fast"
+    # === LOAD FULL HISTORY ===
+    history = load_chat_history(chat_id) if chat_id else []
+    if not chat_id:
+        chat_id = str(uuid.uuid4())
+
+    # Save user message immediately
+    user_msg = {"role": "user", "content": question}
+    history.append(user_msg)
 
     async def generate():
-        nonlocal general_answer, chat_id, model
         full_text = ""
         citations = []
         has_error = False
-        search_params = None
-        messages = []
-        history = []
-
-        # Load or initialize chat history
-        if chat_id:
-            chat_data = load_chat_history(chat_id)
-            if chat_data:
-                history = chat_data.get("history", [])
-                messages = history.copy()
-
-        if not chat_id:
-            chat_id = str(uuid.uuid4())
-
-        # Add system prompt
-        messages.insert(0, {"role": "system", "content": "You are JuristMind, a logical AI specializing in Nigerian law but capable of answering general queries. For law-related answers, quote specific statutes and cases."})
-
-        # Add user message
-        user_msg = {"role": "user", "content": question}
-        messages.append(user_msg)
-        history.append(user_msg)
-
-        if general_answer:
-            sanitized = sanitize_response(general_answer)
-            assistant_msg = {"role": "assistant", "content": sanitized}
-            messages.append(assistant_msg)
-            history.append(assistant_msg)
-            full_text = sanitized
-            yield f"data: {json.dumps({'content': sanitized})}\n\n"
-
-        else:
-            # Handle drafts with template
-            prefix = ""
-            suffix = ""
-            if classification['intent'] == 'draft':
-                template = load_template("default_legal")
-                if '{content}' in template:
-                    parts = template.split('{content}', 1)
-                    prefix = parts[0]
-                    suffix = parts[1] if len(parts) > 1 else ""
-                if prefix:
-                    sanitized_prefix = sanitize_response(prefix)
-                    yield f"data: {json.dumps({'content': sanitized_prefix})}\n\n"
-                    full_text += sanitized_prefix
-
-            # Search configuration
-            if classification['intent'] == 'legal_case':
-                search_params = {
-                    "mode": "auto",
-                    "return_citations": True,
-                    "max_search_results": 3,
-                    "sources": [
-                        {"type": "web"},
-                        {"type": "news"},
-                        {"type": "x"}
-                    ]
-                }
-                custom_prompt = build_reasoned_prompt(question, classification, history, is_case_with_sources=True)
-            else:
-                if classification['needs_search'] or classification['is_draft']:
-                    search_params = {
-                        "mode": "auto",
-                        "return_citations": True,
-                        "max_search_results": 2,
-                        "sources": [
-                            {"type": "web"},
-                            {"type": "news"}
-                        ]
-                    }
-                custom_prompt = build_reasoned_prompt(question, classification, history)
-
-            messages[-1]["content"] = custom_prompt
-
-            # Stream response
-            async for item in query_grok(messages, search_params, model, classification):
-                if item["type"] == "content":
-                    delta = item["delta"]
-                    sanitized_delta = sanitize_response(delta)
-                    yield f"data: {json.dumps({'content': sanitized_delta})}\n\n"
-                    full_text += sanitized_delta
-                elif item["type"] == "citations":
-                    citations = item["data"]
-                elif item["type"] == "warning":
-                    warning_msg = item["message"]
-                    yield f"data: {json.dumps({'content': warning_msg})}\n\n"
-                    full_text += warning_msg
-                elif item["type"] == "error":
-                    has_error = True
-                    error_msg = "[Error] " + item["message"]
-                    yield f"data: {json.dumps({'content': error_msg})}\n\n"
-                    full_text += error_msg
-
-            assistant_msg = {"role": "assistant", "content": full_text}
-            history.append(assistant_msg)
-
-            # Add template suffix for drafts
-            if suffix and classification['intent'] == 'draft' and not has_error:
-                sanitized_suffix = sanitize_response(suffix)
-                yield f"data: {json.dumps({'content': sanitized_suffix})}\n\n"
-                full_text += sanitized_suffix
-                history[-1]["content"] += sanitized_suffix
-
-        if not has_error:
-            save_chat_history(chat_id, history)
-
-        # Append sources (exclude X)
         sources = []
-        if citations and search_params is not None:
+
+        # === INTENT-BASED CONFIG ===
+        intent = classification['intent']
+        config = {
+            'simple_non_law':   {'recent_count': 2, 'model': 'grok-3',       'needs_summary': False},
+            'entity_query':     {'recent_count': 3, 'model': 'grok-3',       'needs_summary': False},
+            'general_legal':    {'recent_count': 3, 'model': 'grok-4-fast',  'needs_summary': True},
+            'general_search':   {'recent_count': 3, 'model': 'grok-4-fast',  'needs_summary': True},
+            'legal_case':       {'recent_count': 4, 'model': 'grok-4',       'needs_summary': True},
+            'draft':            {'recent_count': 3, 'model': 'grok-4-fast',  'needs_summary': True},
+            'direct_response':  {'recent_count': 3, 'model': 'grok-3',       'needs_summary': False},
+        }.get(intent, {'recent_count': 3, 'model': 'grok-4-fast', 'needs_summary': True})
+
+        recent_count = config['recent_count']
+        model = "grok-4-fast" if "think deep" in question.lower() or "think" in question.lower() else config['model']
+        needs_summary = config['needs_summary'] and len(history) > recent_count + 3
+
+        # === BUILD FINAL MESSAGES (TINY CONTEXT) ===
+        messages = [{"role": "system", "content": "You are JuristMind, a logical AI specializing in Nigerian law but capable of answering general queries. For law-related answers, quote specific statutes and cases."}]
+
+        # Add summary if needed
+        if needs_summary:
+            summary = await summarize_history(history)
+            if summary:
+                messages.append({"role": "user", "content": "Here is a summary of our past conversation:"})
+                messages.append({"role": "assistant", "content": summary})
+
+        # Add recent real messages
+        recent_messages = history[-recent_count:]
+        messages.extend([m for m in recent_messages if m["role"] != "assistant" or m is recent_messages[-1]])  # avoid duplicate assistant if last
+
+        # Custom prompt
+        custom_prompt = build_reasoned_prompt(
+            question,
+            classification,
+            history,
+            is_case_with_sources=(intent == 'legal_case')
+        )
+        messages.append({"role": "user", "content": custom_prompt})
+
+        # Search params
+        search_params = None
+        if classification['needs_search'] or intent in ['legal_case', 'draft']:
+            sources_list = [{"type": "web"}, {"type": "news"}]
+            if intent == 'legal_case':
+                sources_list.append({"type": "x"})
+            search_params = {
+                "mode": "auto",
+                "return_citations": True,
+                "max_search_results": 3 if intent == 'legal_case' else 2,
+                "sources": sources_list
+            }
+
+        # === STREAM RESPONSE ===
+        template_prefix = ""
+        template_suffix = ""
+        if intent == 'draft':
+            template = load_template("default_legal")
+            if '{content}' in template:
+                template_prefix, template_suffix = template.split('{content}', 1)
+                if template_prefix:
+                    sanitized = sanitize_response(template_prefix)
+                    yield f"data: {json.dumps({'content': sanitized})}\n\n"
+                    full_text += sanitized
+
+        async for item in query_grok_stream(messages, search_params, model, classification):
+            if item["type"] == "content":
+                delta = sanitize_response(item["delta"])
+                yield f"data: {json.dumps({'content': delta})}\n\n"
+                full_text += delta
+            elif item["type"] == "citations":
+                citations = item["data"]
+            elif item["type"] == "error":
+                has_error = True
+                yield f"data: {json.dumps({'content': '[Error] ' + item['message']})}\n\n"
+
+        # Save assistant response
+        assistant_msg = {"role": "assistant", "content": full_text}
+        history.append(assistant_msg)
+        if template_suffix and intent == 'draft' and not has_error:
+            sanitized_suffix = sanitize_response(template_suffix)
+            yield f"data: {json.dumps({'content': sanitized_suffix})}\n\n"
+            full_text += sanitized_suffix
+            history[-1]["content"] += sanitized_suffix
+
+        # Add sources
+        if citations and search_params:
             for c in citations:
                 if isinstance(c, dict) and 'url' in c and 'x.com' not in c['url'].lower():
-                    sources.append({
-                        "title": c.get("title", c.get("url", "")),
-                        "url": c.get("url", "")
-                    })
+                    sources.append({"title": c.get("title", c.get("url")), "url": c["url"]})
             if sources and "Sources:" not in full_text:
                 sources_text = "\nSources: " + ", ".join([s['url'] for s in sources])
                 yield f"data: {json.dumps({'content': sources_text})}\n\n"
                 full_text += sources_text
                 history[-1]["content"] += sources_text
 
+        save_chat_history(chat_id, history)
         chat_url = f"{BASE_CHAT_URL}/public/chats/{chat_id}.json"
         yield f"data: {json.dumps({'type': 'done', 'chat_id': chat_id, 'chat_url': chat_url, 'sources': sources})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
+# ==================== UTILS ====================
+def load_template(template_name: str) -> str:
+    try:
+        with open(f"templates/{template_name}.txt", "r", encoding="utf-8") as f:
+            return f.read()
+    except:
+        return "{content}"
+
+@app.get("/")
+async def root():
+    return {"message": "JuristMind API – Optimized & Cost-Effective"}
+
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse("static/favicon.ico", media_type="image/x-icon")
+
 @app.get("/chat/{chat_id}")
 async def get_chat(chat_id: str):
-    chat_data = load_chat_history(chat_id)
-    if not chat_data:
+    history = load_chat_history(chat_id)
+    if not history:
         raise HTTPException(status_code=404, detail="Chat not found")
-    return chat_data
+    return {"id": chat_id, "history": history}
 
 if __name__ == "__main__":
     import uvicorn
